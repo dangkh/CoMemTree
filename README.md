@@ -27,7 +27,10 @@ python precompute_memory_create.py \
 
 Use `--number_of_users 0` to process all users.
 
-## 2. Build global memory
+## 2. Baseline 
+
+### 2.1. AMem4Rec baseline
+Build global memory
 
 ```bash
 python build_global_memory.py \
@@ -43,7 +46,7 @@ python build_global_memory.py \
   --save_every 100
 ```
 
-## 3. AMem4Rec baseline
+### 2.2 AMem4Rec baseline
 
 Run recommendation with the constructed memory:
 
@@ -52,14 +55,14 @@ python inference_amem.py \
   --global_memory agent_memory/CDs/global_memory.json \
   --items data/CDs/items.json \
   --sequences data/CDs/user_sequences_10_5000.json \
-  --negatives data/CDs/<negative_file>.json \
+  --negatives data/CDs/user_negatives_10_5000.json \
   --output results/CDs/amem4rec.json \
   --k_memories 3 \
   --history_size 10 \
   --number_of_users 1000
 ```
 
-## 4. NativeLLM baseline
+### 2.3 NativeLLM baseline
 
 NativeLLM uses the same candidate set and ranking LLM, but **does not retrieve memory**.
 
@@ -68,7 +71,7 @@ python inference_amem.py \
   --global_memory unused.json \
   --items data/CDs/items.json \
   --sequences data/CDs/user_sequences_10_5000.json \
-  --negatives data/CDs/<negative_file>.json \
+  --negatives data/CDs/user_negatives_10_5000.json \
   --output results/CDs/native_llm.json \
   --history_size 10 \
   --number_of_users 1000 \
@@ -76,6 +79,64 @@ python inference_amem.py \
 ```
 
 `unused.json` does not need to exist when `--no_memory` is enabled.
+
+
+## 3. Tree Construction
+Clustering
+```bash
+python build_reverse_behavior_tree_cluster.py \
+  --input precomputed/CDs/local_memories_gemma.jsonl \
+  --output-dir behavior_tree_out_cluster_k50 \
+  --cluster-text-field pattern_description \
+  --num-clusters 50 \
+  --encoder qwen \
+  --embedding-model Qwen/Qwen3-Embedding-0.6B \
+  --max-order 5 \
+  --count-mode user_normalized \
+  --min-support-users 3 \
+  --min-support-occurrences 3 \
+  --min-jsd 0.05 \
+  --smoothing-kappa 5
+```
+
+
+## 4. Inferencing
+
+### 4.1 Generate behavior for test user
+
+```bash
+python precompute_test_behavior.py \
+  --items data/CDs/items.json \
+  --sequences data/CDs/user_sequences_10_5000.json \
+  --tree-dir behavior_tree_out_gemini_hybrid \
+  --core-script infer_tree_amem_gemma_hybrid_v2.py \
+  --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
+  --window-size 3 \
+  --max-train-interactions 30 \
+  --behavior-generation-mode single \
+  --behavior-max-attempts 2 \
+  --state-margin-threshold 0.05 \
+  --top-next 3 \
+  --output precomputed/CDs/test_user_tree_evidence_gemma.jsonl \
+  --summary-output precomputed/CDs/test_user_tree_evidence_gemma.summary.json \
+  --resume
+```
+
+### 4.1 Testing
+
+```bash
+python infer_tree_gemma.py \
+  --items data/CDs/items.json \
+  --sequences data/CDs/user_sequences_10_5000.json \
+  --negatives data/CDs/user_negatives_10_5000.json \
+  --precomputed-evidence precomputed/CDs/test_user_tree_evidence_gemma.jsonl \
+  --core-script infer_tree_amem_gemma_hybrid_v2.py \
+  --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
+  --max-users 10 \
+  --run-baseline \
+  --output results/tree_gemma_precomputed_test10.jsonl \
+  --summary-output results/tree_gemma_precomputed_test10_summary.json
+```
 
 ## Notes
 
