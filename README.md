@@ -105,20 +105,16 @@ python build_reverse_behavior_tree_cluster.py \
 ### 4.1 Generate behavior for test user
 
 ```bash
-python precompute_test_behavior.py \
+python precompute_test_behaviors_gemma.py \
   --items data/CDs/items.json \
   --sequences data/CDs/user_sequences_10_5000.json \
-  --tree-dir behavior_tree_out_gemini_hybrid \
-  --core-script infer_tree_amem_gemma_hybrid_v2.py \
   --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
   --window-size 3 \
   --max-train-interactions 30 \
-  --behavior-generation-mode single \
-  --behavior-max-attempts 2 \
-  --state-margin-threshold 0.05 \
-  --top-next 3 \
-  --output precomputed/CDs/test_user_tree_evidence_gemma.jsonl \
-  --summary-output precomputed/CDs/test_user_tree_evidence_gemma.summary.json \
+  --recent-behaviors 5 \
+  --max-users 300 \
+  --output precomputed/CDs/test_user_behaviors_gemma.jsonl \
+  --summary-output precomputed/CDs/test_user_behaviors_gemma.summary.json \
   --resume
 ```
 
