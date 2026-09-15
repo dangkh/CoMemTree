@@ -116,9 +116,23 @@ python precompute_test_behaviors_gemma.py \
   --output precomputed/CDs/test_user_behaviors_gemma.jsonl \
   --summary-output precomputed/CDs/test_user_behaviors_gemma.summary.json \
   --resume
+
+
+python precompute_test_behaviors_gemma_batch.py \
+  --items data/CDs/items.json \
+  --sequences data/CDs/user_sequences_10_5000.json \
+  --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
+  --window-size 3 \
+  --max-train-interactions 30 \
+  --batch-size 8 \
+  --recent-behaviors 5 \
+  --max-users 300 \
+  --output precomputed/CDs/test_user_behaviors_gemma.jsonl \
+  --summary-output precomputed/CDs/test_user_behaviors_gemma.summary.json \
+  --resume
 ```
 
-### 4.1 Testing
+### 4.2 Testing
 
 ```bash
 python infer_tree_gemma.py \
