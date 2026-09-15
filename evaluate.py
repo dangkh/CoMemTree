@@ -6,7 +6,7 @@ import os
 
 def dcg_at_k(relevances: List[float], k: int) -> float:
     """Calculate Discounted Cumulative Gain at k"""
-    relevances = np.asfarray(relevances)[:k]
+    relevances = np.asarray(relevances)[:k]
     if relevances.size == 0:
         return 0.0
     return np.sum(relevances / np.log2(np.arange(2, relevances.size + 2)))

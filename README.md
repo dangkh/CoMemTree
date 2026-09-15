@@ -135,17 +135,19 @@ python precompute_test_behaviors_gemma_batch.py \
 ### 4.2 Testing
 
 ```bash
-python infer_tree_gemma.py \
+python infer_tree_gemma_precom.py \
   --items data/CDs/items.json \
   --sequences data/CDs/user_sequences_10_5000.json \
   --negatives data/CDs/user_negatives_10_5000.json \
-  --precomputed-evidence precomputed/CDs/test_user_tree_evidence_gemma.jsonl \
-  --core-script infer_tree_amem_gemma_hybrid_v2.py \
+  --precomputed-behaviors precomputed/CDs/test_user_behaviors_gemma.jsonl \
+  --tree-dir behavior_tree_out_cluster_k50 \
+  --state-mode cluster \
   --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
+  --top-next 3 \
   --max-users 10 \
   --run-baseline \
-  --output results/tree_gemma_precomputed_test10.jsonl \
-  --summary-output results/tree_gemma_precomputed_test10_summary.json
+  --output results/tree_cluster50_precomputed_test10.jsonl \
+  --summary-output results/tree_cluster50_precomputed_test10_summary.json
 ```
 
 ## Notes
