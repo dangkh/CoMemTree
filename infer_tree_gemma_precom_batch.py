@@ -45,6 +45,7 @@ python infer_tree_amem_precomputed_behaviors_standalone.py \
   --tree-dir behavior_tree_out_gemini_hybrid \
   --state-mode hybrid \
   --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
+  --llm-batch-size 8 \
   --top-next 3 \
   --max-users 10 \
   --run-baseline \
@@ -61,6 +62,7 @@ python infer_tree_amem_precomputed_behaviors_standalone.py \
   --tree-dir behavior_tree_out_cluster_k50 \
   --state-mode cluster \
   --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
+  --llm-batch-size 8 \
   --top-next 3 \
   --max-users 10 \
   --run-baseline \
@@ -625,14 +627,13 @@ Return JSON only:
 
         return sid, conf
 
-    def rank(
+    def _build_rank_prompt(
         self,
         *,
         history_items: List[Dict[str, str]],
         candidate_items: List[Dict[str, str]],
         tree_evidence: Optional[Dict[str, Any]],
-        call_type: str,
-    ) -> Tuple[List[str], Dict[str, Any]]:
+    ) -> Tuple[str, str, List[str]]:
         ids = [
             str(x["item_id"])
             for x in candidate_items
@@ -676,16 +677,32 @@ Return JSON only:
 {{"ranked_item_ids":[...],"reasoning":"one concise sentence"}}
 """
 
+        system = (
+            "You are a recommendation ranking system. "
+            "Return valid JSON only."
+        )
+
+        return system, prompt, ids
+
+    def rank(
+        self,
+        *,
+        history_items: List[Dict[str, str]],
+        candidate_items: List[Dict[str, str]],
+        tree_evidence: Optional[Dict[str, Any]],
+        call_type: str,
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        system, prompt, ids = self._build_rank_prompt(
+            history_items=history_items,
+            candidate_items=candidate_items,
+            tree_evidence=tree_evidence,
+        )
+
         obj = self._generate_json(
-            system=(
-                "You are a recommendation ranking system. "
-                "Return valid JSON only."
-            ),
+            system=system,
             prompt=prompt,
             call_type=call_type,
-            max_new_tokens=(
-                self.rank_max_new_tokens
-            ),
+            max_new_tokens=self.rank_max_new_tokens,
         )
 
         if not isinstance(obj, dict):
@@ -703,7 +720,344 @@ Return JSON only:
                 obj.get("reasoning", "")
             ),
             "parse_ok": True,
+            "batched": False,
         }
+
+    def _generate_json_batch(
+        self,
+        *,
+        systems: List[str],
+        prompts: List[str],
+        call_type: str,
+        max_new_tokens: int,
+    ) -> List[Optional[Any]]:
+        """
+        Multiple independent prompts in ONE model.generate() call.
+
+        Each user still has a separate prompt and a separate JSON output.
+        Users are NOT combined into one prompt.
+        """
+        if len(systems) != len(prompts):
+            raise ValueError(
+                "systems/prompts length mismatch"
+            )
+
+        if not prompts:
+            return []
+
+        rendered: List[str] = []
+
+        for system, prompt in zip(
+            systems,
+            prompts,
+        ):
+            messages = [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        system
+                        + "\n\n"
+                        + prompt
+                    ),
+                }],
+            }]
+
+            rendered.append(
+                self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+
+        inputs = self.tokenizer(
+            rendered,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length,
+        ).to(self.model.device)
+
+        # padding_side='left', therefore generated tokens start after
+        # this common padded input width for every sample.
+        input_width = int(
+            inputs["input_ids"].shape[1]
+        )
+
+        kwargs: Dict[str, Any] = {
+            "max_new_tokens": int(max_new_tokens),
+            "use_cache": True,
+            "pad_token_id": (
+                self.tokenizer.pad_token_id
+            ),
+        }
+
+        if self.temperature > 0:
+            kwargs.update({
+                "do_sample": True,
+                "temperature": self.temperature,
+                "top_p": 0.95,
+            })
+        else:
+            kwargs["do_sample"] = False
+
+        t0 = time.time()
+
+        with self.torch.inference_mode():
+            out = self.model.generate(
+                **inputs,
+                **kwargs,
+            )
+
+        generated = out[:, input_width:]
+
+        raws = self.tokenizer.batch_decode(
+            generated,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        elapsed = float(
+            time.time() - t0
+        )
+
+        batch_n = len(prompts)
+        results: List[Optional[Any]] = []
+
+        for raw, gen_row in zip(
+            raws,
+            generated,
+        ):
+            parse_ok = False
+            obj: Optional[Any] = None
+
+            try:
+                obj = _extract_json_value(
+                    raw.strip()
+                )
+                parse_ok = True
+            except Exception:
+                obj = None
+
+            self.calls.append(
+                LocalCallStat(
+                    call_type=call_type,
+                    # approximate per-sample padded input width
+                    input_tokens=input_width,
+                    output_tokens=int(
+                        gen_row.shape[0]
+                    ),
+                    elapsed_sec=(
+                        elapsed
+                        / max(
+                            1,
+                            batch_n,
+                        )
+                    ),
+                    parse_ok=parse_ok,
+                )
+            )
+
+            results.append(obj)
+
+        return results
+
+    def rank_batch(
+        self,
+        jobs: List[Dict[str, Any]],
+        *,
+        batch_size: int,
+        call_type: str,
+    ) -> List[
+        Tuple[
+            List[str],
+            Dict[str, Any],
+        ]
+    ]:
+        """
+        Batch ranking across users.
+
+        `jobs` entries:
+        {
+          "history_items": [...],
+          "candidate_items": [...],
+          "tree_evidence": {...} or None
+        }
+
+        On a batch-level generation failure, that batch falls back to
+        individual rank() calls. If only one sample has malformed JSON,
+        only that sample is retried individually.
+        """
+        if not jobs:
+            return []
+
+        batch_size = max(
+            1,
+            int(batch_size),
+        )
+
+        final: List[
+            Optional[
+                Tuple[
+                    List[str],
+                    Dict[str, Any],
+                ]
+            ]
+        ] = [
+            None
+            for _ in jobs
+        ]
+
+        for start in range(
+            0,
+            len(jobs),
+            batch_size,
+        ):
+            end = min(
+                start + batch_size,
+                len(jobs),
+            )
+
+            chunk = jobs[
+                start:end
+            ]
+
+            systems: List[str] = []
+            prompts: List[str] = []
+            candidate_id_lists: List[
+                List[str]
+            ] = []
+
+            for job in chunk:
+                (
+                    system,
+                    prompt,
+                    ids,
+                ) = self._build_rank_prompt(
+                    history_items=job[
+                        "history_items"
+                    ],
+                    candidate_items=job[
+                        "candidate_items"
+                    ],
+                    tree_evidence=job.get(
+                        "tree_evidence"
+                    ),
+                )
+
+                systems.append(system)
+                prompts.append(prompt)
+                candidate_id_lists.append(
+                    ids
+                )
+
+            try:
+                objs = self._generate_json_batch(
+                    systems=systems,
+                    prompts=prompts,
+                    call_type=call_type,
+                    max_new_tokens=(
+                        self.rank_max_new_tokens
+                    ),
+                )
+            except Exception as e:
+                print(
+                    f"[WARN] ranking batch "
+                    f"{start}:{end} failed: "
+                    f"{type(e).__name__}: {e}; "
+                    "falling back to individual ranking",
+                    flush=True,
+                )
+                objs = [
+                    None
+                    for _ in chunk
+                ]
+
+            for local_idx, (
+                job,
+                ids,
+                obj,
+            ) in enumerate(
+                zip(
+                    chunk,
+                    candidate_id_lists,
+                    objs,
+                )
+            ):
+                global_idx = (
+                    start + local_idx
+                )
+
+                if isinstance(
+                    obj,
+                    dict,
+                ):
+                    ranked = sanitize_ranking(
+                        obj.get(
+                            "ranked_item_ids",
+                            [],
+                        ),
+                        ids,
+                    )
+
+                    final[
+                        global_idx
+                    ] = (
+                        ranked,
+                        {
+                            "reasoning": str(
+                                obj.get(
+                                    "reasoning",
+                                    "",
+                                )
+                            ),
+                            "parse_ok": True,
+                            "batched": True,
+                        },
+                    )
+                    continue
+
+                print(
+                    f"[WARN] ranking parse failed "
+                    f"for batch sample index="
+                    f"{global_idx}; retrying "
+                    "that sample individually",
+                    flush=True,
+                )
+
+                # Only this failed sample pays the single-user retry cost.
+                final[
+                    global_idx
+                ] = self.rank(
+                    history_items=job[
+                        "history_items"
+                    ],
+                    candidate_items=job[
+                        "candidate_items"
+                    ],
+                    tree_evidence=job.get(
+                        "tree_evidence"
+                    ),
+                    call_type=(
+                        call_type
+                        + "_retry"
+                    ),
+                )
+
+        if any(
+            x is None
+            for x in final
+        ):
+            raise RuntimeError(
+                "Internal error: unresolved batch ranking output"
+            )
+
+        return [
+            x
+            for x in final
+            if x is not None
+        ]
 
     def stats(self) -> Dict[str, Any]:
         by: Dict[str, Dict[str, Any]] = {}
@@ -2504,6 +2858,15 @@ def parse_args() -> argparse.Namespace:
         default=768,
     )
     p.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=8,
+        help=(
+            "Number of independent user-ranking prompts per "
+            "model.generate() call. Start with 8; lower if GPU OOM."
+        ),
+    )
+    p.add_argument(
         "--verifier-max-new-tokens",
         type=int,
         default=96,
@@ -2903,12 +3266,16 @@ def main() -> None:
         f"ranking model       : "
         f"{args.model}"
     )
+    print(
+        f"LLM batch size      : "
+        f"{args.llm_batch_size}"
+    )
 
     failures = 0
     t0 = time.time()
 
     pbar = tqdm(
-        pending,
+        total=len(pending),
         desc=(
             "NativeLLM baseline"
             if args.baseline_only
@@ -2918,306 +3285,548 @@ def main() -> None:
         dynamic_ncols=True,
     )
 
-    for uid in pbar:
-        try:
-            user_data = (
-                user_sequences[uid]
+    # Process users in chunks so final LLM ranking can be batched.
+    for batch_start in range(
+        0,
+        len(pending),
+        max(
+            1,
+            int(args.llm_batch_size),
+        ),
+    ):
+        batch_uids = pending[
+            batch_start:
+            batch_start
+            + max(
+                1,
+                int(args.llm_batch_size),
             )
+        ]
 
-            behaviors = None
-            mappings = None
-            state_sequence = None
-            tree_result = None
-            tree_evidence = None
+        prepared: List[
+            Dict[str, Any]
+        ] = []
 
-            if not args.baseline_only:
-                cache_row = (
-                    behavior_cache[uid]
+        # ----------------------------------------------------------
+        # Phase A: non-ranking preparation for each user.
+        # Cluster/Qwen mapping is already efficient; hybrid verifier
+        # may still make individual calls for ambiguous states.
+        # ----------------------------------------------------------
+        for uid in batch_uids:
+            try:
+                user_data = (
+                    user_sequences[uid]
                 )
 
-                validate_behavior_cache_history(
-                    uid=uid,
-                    cache_row=cache_row,
+                behaviors = None
+                mappings = None
+                state_sequence = None
+                tree_result = None
+                tree_evidence = None
+
+                if not args.baseline_only:
+                    cache_row = (
+                        behavior_cache[uid]
+                    )
+
+                    validate_behavior_cache_history(
+                        uid=uid,
+                        cache_row=cache_row,
+                        user_data=user_data,
+                        max_train_interactions=(
+                            args.max_train_interactions
+                        ),
+                        strict=(
+                            args.strict_cache_history
+                        ),
+                    )
+
+                    behaviors = [
+                        dict(x)
+                        for x in cache_row.get(
+                            "generated_behaviors",
+                            [],
+                        )
+                    ]
+
+                    if not behaviors:
+                        raise ValueError(
+                            f"user={uid}: "
+                            "no precomputed behaviors"
+                        )
+
+                    mappings = (
+                        vocab.map_behaviors(
+                            behaviors=behaviors,
+                            llm=llm,
+                            margin_threshold=(
+                                args.state_margin_threshold
+                            ),
+                        )
+                    )
+
+                    state_sequence = [
+                        str(
+                            m["state_id"]
+                        )
+                        for m in mappings
+                    ]
+
+                    tree_result = (
+                        tree.query(
+                            state_sequence=(
+                                state_sequence
+                            ),
+                            top_next=(
+                                args.top_next
+                            ),
+                        )
+                    )
+
+                    tree_evidence = (
+                        build_tree_evidence(
+                            mappings=mappings,
+                            tree_result=(
+                                tree_result
+                            ),
+                            recent_count=(
+                                args.recent_behaviors
+                            ),
+                        )
+                    )
+
+                negative_data = (
+                    user_negatives.get(
+                        uid,
+                        {},
+                    )
+                )
+
+                (
+                    candidate_ids,
+                    ground_truth,
+                ) = get_candidates_for_user(
+                    user_id=uid,
                     user_data=user_data,
-                    max_train_interactions=(
-                        args.max_train_interactions
+                    negative_data=(
+                        negative_data
                     ),
-                    strict=(
-                        args.strict_cache_history
+                    candidate_file_rows=(
+                        candidate_rows
                     ),
+                    seed=args.seed,
                 )
 
-                behaviors = [
-                    dict(x)
-                    for x in cache_row.get(
-                        "generated_behaviors",
+                candidate_items = [
+                    get_item_info(
+                        i,
+                        items_meta,
+                    )
+                    for i in candidate_ids
+                ]
+
+                train_ids = list(
+                    user_data.get(
+                        "train",
                         [],
                     )
-                ]
-
-                if not behaviors:
-                    raise ValueError(
-                        f"user={uid}: no precomputed behaviors"
-                    )
-
-                mappings = (
-                    vocab.map_behaviors(
-                        behaviors=behaviors,
-                        llm=llm,
-                        margin_threshold=(
-                            args.state_margin_threshold
-                        ),
-                    )
                 )
 
-                state_sequence = [
-                    str(m["state_id"])
-                    for m in mappings
+                history_items = [
+                    get_item_info(
+                        i,
+                        items_meta,
+                    )
+                    for i in train_ids[
+                        -args.max_train_interactions:
+                    ]
                 ]
 
-                tree_result = tree.query(
-                    state_sequence=(
+                prepared.append({
+                    "user_id": uid,
+                    "behaviors": behaviors,
+                    "mappings": mappings,
+                    "state_sequence": (
                         state_sequence
                     ),
-                    top_next=(
-                        args.top_next
+                    "tree_result": (
+                        tree_result
                     ),
-                )
-
-                tree_evidence = (
-                    build_tree_evidence(
-                        mappings=mappings,
-                        tree_result=tree_result,
-                        recent_count=(
-                            args.recent_behaviors
-                        ),
-                    )
-                )
-
-            negative_data = (
-                user_negatives.get(
-                    uid,
-                    {},
-                )
-            )
-
-            (
-                candidate_ids,
-                ground_truth,
-            ) = get_candidates_for_user(
-                user_id=uid,
-                user_data=user_data,
-                negative_data=(
-                    negative_data
-                ),
-                candidate_file_rows=(
-                    candidate_rows
-                ),
-                seed=args.seed,
-            )
-
-            candidate_items = [
-                get_item_info(
-                    i,
-                    items_meta,
-                )
-                for i in candidate_ids
-            ]
-
-            train_ids = list(
-                user_data.get(
-                    "train",
-                    [],
-                )
-            )
-
-            history_items = [
-                get_item_info(
-                    i,
-                    items_meta,
-                )
-                for i in train_ids[
-                    -args.max_train_interactions:
-                ]
-            ]
-
-            tree_ranked = None
-            tree_rank_meta = None
-            tree_metrics = None
-            baseline_ranked = None
-            baseline_meta = None
-            baseline_metrics = None
-
-            if not args.baseline_only:
-                (
-                    tree_ranked,
-                    tree_rank_meta,
-                ) = llm.rank(
-                    history_items=(
-                        history_items
+                    "tree_evidence": (
+                        tree_evidence
                     ),
-                    candidate_items=(
+                    "candidate_ids": (
+                        candidate_ids
+                    ),
+                    "ground_truth": (
+                        ground_truth
+                    ),
+                    "candidate_items": (
                         candidate_items
                     ),
-                    tree_evidence=(
-                        tree_evidence
+                    "history_items": (
+                        history_items
+                    ),
+                })
+
+            except Exception as e:
+                failures += 1
+
+                print(
+                    f"\n[WARN] user={uid} "
+                    f"failed during preparation: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+
+        # ----------------------------------------------------------
+        # Phase B: batched final LLM ranking.
+        # ----------------------------------------------------------
+        tree_results_batch: List[
+            Optional[
+                Tuple[
+                    List[str],
+                    Dict[str, Any],
+                ]
+            ]
+        ] = [
+            None
+            for _ in prepared
+        ]
+
+        baseline_results_batch: List[
+            Optional[
+                Tuple[
+                    List[str],
+                    Dict[str, Any],
+                ]
+            ]
+        ] = [
+            None
+            for _ in prepared
+        ]
+
+        if (
+            prepared
+            and not args.baseline_only
+        ):
+            tree_jobs = [
+                {
+                    "history_items": x[
+                        "history_items"
+                    ],
+                    "candidate_items": x[
+                        "candidate_items"
+                    ],
+                    "tree_evidence": x[
+                        "tree_evidence"
+                    ],
+                }
+                for x in prepared
+            ]
+
+            try:
+                ranked = llm.rank_batch(
+                    tree_jobs,
+                    batch_size=(
+                        args.llm_batch_size
                     ),
                     call_type=(
                         "tree_ranking"
                     ),
                 )
 
-                tree_metrics = (
-                    ranking_metrics(
-                        tree_ranked,
-                        ground_truth,
-                    )
+                tree_results_batch = [
+                    x
+                    for x in ranked
+                ]
+
+            except Exception as e:
+                failures += len(
+                    prepared
                 )
 
-            # NativeLLM baseline:
-            # - baseline-only: YES
-            # - tree + --run-baseline: YES
-            # - tree-only: NO
-            if (
+                print(
+                    f"\n[WARN] tree ranking "
+                    f"batch failed completely: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+
+                # Mark these prepared users as failed;
+                # no rows will be written below.
+                tree_results_batch = [
+                    None
+                    for _ in prepared
+                ]
+
+        if (
+            prepared
+            and (
                 args.baseline_only
                 or args.run_baseline
-            ):
-                (
-                    baseline_ranked,
-                    baseline_meta,
-                ) = llm.rank(
-                    history_items=(
-                        history_items
+            )
+        ):
+            baseline_jobs = [
+                {
+                    "history_items": x[
+                        "history_items"
+                    ],
+                    "candidate_items": x[
+                        "candidate_items"
+                    ],
+                    "tree_evidence": None,
+                }
+                for x in prepared
+            ]
+
+            try:
+                ranked = llm.rank_batch(
+                    baseline_jobs,
+                    batch_size=(
+                        args.llm_batch_size
                     ),
-                    candidate_items=(
-                        candidate_items
-                    ),
-                    tree_evidence=None,
                     call_type=(
                         "baseline_ranking"
                     ),
                 )
 
-                baseline_metrics = (
-                    ranking_metrics(
+                baseline_results_batch = [
+                    x
+                    for x in ranked
+                ]
+
+            except Exception as e:
+                failures += len(
+                    prepared
+                )
+
+                print(
+                    f"\n[WARN] baseline ranking "
+                    f"batch failed completely: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+
+                baseline_results_batch = [
+                    None
+                    for _ in prepared
+                ]
+
+        # ----------------------------------------------------------
+        # Phase C: metrics + write rows.
+        # ----------------------------------------------------------
+        for idx, item in enumerate(
+            prepared
+        ):
+            uid = item[
+                "user_id"
+            ]
+
+            tree_ranked = None
+            tree_rank_meta = None
+            tree_metrics = None
+
+            baseline_ranked = None
+            baseline_meta = None
+            baseline_metrics = None
+
+            try:
+                if not args.baseline_only:
+                    tree_pair = (
+                        tree_results_batch[
+                            idx
+                        ]
+                    )
+
+                    if tree_pair is None:
+                        raise RuntimeError(
+                            "Tree ranking result "
+                            "missing for user"
+                        )
+
+                    (
+                        tree_ranked,
+                        tree_rank_meta,
+                    ) = tree_pair
+
+                    tree_metrics = (
+                        ranking_metrics(
+                            tree_ranked,
+                            item[
+                                "ground_truth"
+                            ],
+                        )
+                    )
+
+                if (
+                    args.baseline_only
+                    or args.run_baseline
+                ):
+                    baseline_pair = (
+                        baseline_results_batch[
+                            idx
+                        ]
+                    )
+
+                    if baseline_pair is None:
+                        raise RuntimeError(
+                            "Baseline ranking "
+                            "result missing for user"
+                        )
+
+                    (
                         baseline_ranked,
-                        ground_truth,
+                        baseline_meta,
+                    ) = baseline_pair
+
+                    baseline_metrics = (
+                        ranking_metrics(
+                            baseline_ranked,
+                            item[
+                                "ground_truth"
+                            ],
+                        )
                     )
+
+                row = {
+                    "schema_version": (
+                        "amem_precomputed_behavior_"
+                        "tree_inference_v2_batch"
+                    ),
+                    "user_id": uid,
+                    "run_mode": (
+                        "baseline-only"
+                        if args.baseline_only
+                        else (
+                            "tree+baseline"
+                            if args.run_baseline
+                            else "tree-only"
+                        )
+                    ),
+                    "state_mode": (
+                        None
+                        if args.baseline_only
+                        else args.state_mode
+                    ),
+                    "behavior_cache_user_id": (
+                        None
+                        if args.baseline_only
+                        else uid
+                    ),
+                    "generated_behaviors": (
+                        item[
+                            "behaviors"
+                        ]
+                    ),
+                    "state_mappings": (
+                        item[
+                            "mappings"
+                        ]
+                    ),
+                    "state_sequence": (
+                        item[
+                            "state_sequence"
+                        ]
+                    ),
+                    "tree_result": (
+                        item[
+                            "tree_result"
+                        ]
+                    ),
+                    "tree_evidence": (
+                        item[
+                            "tree_evidence"
+                        ]
+                    ),
+                    "candidate_item_ids": (
+                        item[
+                            "candidate_ids"
+                        ]
+                    ),
+                    "ground_truth_item_ids": (
+                        item[
+                            "ground_truth"
+                        ]
+                    ),
+                    "tree_ranked_item_ids": (
+                        tree_ranked
+                    ),
+                    "tree_rank_meta": (
+                        tree_rank_meta
+                    ),
+                    "tree_metrics": (
+                        tree_metrics
+                    ),
+                    "baseline_ranked_item_ids": (
+                        baseline_ranked
+                    ),
+                    "baseline_rank_meta": (
+                        baseline_meta
+                    ),
+                    "baseline_metrics": (
+                        baseline_metrics
+                    ),
+                }
+
+                append_jsonl(
+                    args.output,
+                    row,
                 )
 
-            row = {
-                "schema_version": (
-                    "amem_precomputed_behavior_"
-                    "tree_inference_v1"
-                ),
-                "user_id": uid,
-                "run_mode": (
-                    "baseline-only"
-                    if args.baseline_only
-                    else (
-                        "tree+baseline"
-                        if args.run_baseline
-                        else "tree-only"
+                if args.baseline_only:
+                    pbar.set_postfix(
+                        rank=(
+                            baseline_metrics.get(
+                                "target_rank"
+                            )
+                            if baseline_metrics
+                            else None
+                        ),
+                        refresh=False,
                     )
-                ),
-                "state_mode": (
-                    None
-                    if args.baseline_only
-                    else args.state_mode
-                ),
-                "behavior_cache_user_id": (
-                    None
-                    if args.baseline_only
-                    else uid
-                ),
-                "generated_behaviors": (
-                    behaviors
-                ),
-                "state_mappings": (
-                    mappings
-                ),
-                "state_sequence": (
-                    state_sequence
-                ),
-                "tree_result": (
-                    tree_result
-                ),
-                "tree_evidence": (
-                    tree_evidence
-                ),
-                "candidate_item_ids": (
-                    candidate_ids
-                ),
-                "ground_truth_item_ids": (
-                    ground_truth
-                ),
-                "tree_ranked_item_ids": (
-                    tree_ranked
-                ),
-                "tree_rank_meta": (
-                    tree_rank_meta
-                ),
-                "tree_metrics": (
-                    tree_metrics
-                ),
-                "baseline_ranked_item_ids": (
-                    baseline_ranked
-                ),
-                "baseline_rank_meta": (
-                    baseline_meta
-                ),
-                "baseline_metrics": (
-                    baseline_metrics
-                ),
-            }
+                else:
+                    tr = (
+                        item[
+                            "tree_result"
+                        ]
+                        or {}
+                    )
 
-            append_jsonl(
-                args.output,
-                row,
-            )
+                    pbar.set_postfix(
+                        order=tr.get(
+                            "matched_order",
+                            0,
+                        ),
+                        next=len(
+                            tr.get(
+                                "next_behaviors",
+                                [],
+                            )
+                        ),
+                        rank=(
+                            tree_metrics.get(
+                                "target_rank"
+                            )
+                            if tree_metrics
+                            else None
+                        ),
+                        refresh=False,
+                    )
 
-            if args.baseline_only:
-                pbar.set_postfix(
-                    rank=(
-                        baseline_metrics.get(
-                            "target_rank"
-                        )
-                        if baseline_metrics
-                        else None
-                    ),
-                    refresh=False,
-                )
-            else:
-                pbar.set_postfix(
-                    order=tree_result.get(
-                        "matched_order",
-                        0,
-                    ),
-                    next=len(
-                        tree_result.get(
-                            "next_behaviors",
-                            [],
-                        )
-                    ),
-                    rank=(
-                        tree_metrics.get(
-                            "target_rank"
-                        )
-                        if tree_metrics
-                        else None
-                    ),
-                    refresh=False,
+            except Exception as e:
+                failures += 1
+
+                print(
+                    f"\n[WARN] user={uid} "
+                    f"failed during ranking/write: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
                 )
 
-        except Exception as e:
-            failures += 1
-
-            print(
-                f"\n[WARN] user={uid} "
-                f"failed: "
-                f"{type(e).__name__}: {e}",
-                flush=True,
-            )
+        pbar.update(
+            len(batch_uids)
+        )
 
     pbar.close()
 
@@ -3454,6 +4063,9 @@ def main() -> None:
                 args.max_train_interactions
             ),
             "model": args.model,
+            "llm_batch_size": (
+                args.llm_batch_size
+            ),
             "run_baseline": (
                 args.run_baseline
             ),
