@@ -71,8 +71,8 @@ from unsloth import FastModel
 from unsloth.chat_templates import get_chat_template
 
 
-SCHEMA_VERSION = "amem_local_memory_dual_behavior_v3"
-BEHAVIOR_PROMPT_VERSION = "dual_view_discriminative_behavior_v1"
+SCHEMA_VERSION = "amem_local_memory_dual_behavior_v4"
+BEHAVIOR_PROMPT_VERSION = "dual_view_discriminative_behavior_v2_taxonomy"
 
 
 # =============================================================================
@@ -175,6 +175,84 @@ Allowed direction labels:
   "unknown"
 ]
 
+
+TAXONOMY — USE THESE DEFINITIONS STRICTLY
+
+MECHANISM:
+- repetition:
+  Literal repetition of the EXACT SAME item_id inside the observed window.
+  NEVER use repetition merely because different items are similar.
+- persistence:
+  Different item_ids maintain the same broad preference without a clear move
+  toward a narrower/more specific preference.
+- collection expansion:
+  Different item_ids expand an identifiable creator/series/collection/family.
+- deepening:
+  Different item_ids move further into the same focused subcategory/style/theme.
+- narrowing:
+  Preference becomes more selective/specific than earlier interactions.
+- broadening:
+  Preference expands to a wider range while retaining a recognizable anchor.
+- shifting:
+  A clear move from one preference/category/style toward another.
+- returning:
+  The user comes back to an earlier preference after an intervening different one.
+- adjacent exploration:
+  Movement into a clearly related neighboring category/style.
+- cross-category exploration:
+  Movement across substantially different categories/styles.
+- refinement:
+  Different item_ids explore variants inside a very narrow preference.
+- unknown:
+  Only when the observed evidence is genuinely insufficient.
+
+SCOPE:
+- same item:
+  ONLY when the exact same item_id occurs more than once.
+- same creator:
+  Different item_ids but clear creator/artist continuity is visible.
+- same collection/series:
+  Different item_ids within an identifiable series/collection/family.
+- same subcategory:
+  Different item_ids sharing a focused genre/subgenre/product subtype.
+- same broad category:
+  Different item_ids sharing only a broad category.
+- related category:
+  Different but clearly neighboring categories.
+- cross-category:
+  Clearly different categories.
+- mixed:
+  No single relational scope dominates.
+- unknown:
+  Evidence is insufficient.
+
+DIRECTION:
+- repeat:
+  ONLY for literal repeat of an exact item_id.
+- stable:
+  Different item_ids maintain a broadly stable preference.
+- deepen:
+  Move further into a focused preference.
+- narrow:
+  Move toward a more specific subset.
+- broaden:
+  Expand the preference range.
+- shift:
+  Move toward a different preference.
+- return:
+  Revisit an earlier preference after leaving it.
+- mixed:
+  Multiple directions coexist.
+- unknown:
+  Evidence is insufficient.
+
+CRITICAL DISAMBIGUATION:
+- Different item_ids that are semantically similar are NOT "repetition".
+- Different albums/products from the same creator are NOT "same item".
+- Different items in the same focused style should usually be persistence,
+  deepening, refinement, or collection expansion depending on the evidence.
+- Use "repetition + same item + repeat" only when an exact item_id repeats.
+
 STRICT RULES:
 1. Use ONLY evidence present in the observed interactions.
 2. Do NOT predict or invent the user's future item.
@@ -187,8 +265,12 @@ STRICT RULES:
 7. Do NOT put artist/item/product titles into trajectory_signature.
 8. mechanism/scope/direction must be domain-agnostic.
 9. Prefer a specific supported label; use "unknown" only when evidence is genuinely weak.
-10. confidence reflects confidence in the trajectory abstraction, from 0.0 to 1.0.
-11. Return JSON only. No markdown.
+10. BEFORE choosing repetition/same item/repeat, explicitly check whether an exact
+    item_id occurs more than once. If all item_ids are distinct, those labels are forbidden.
+11. When item_ids are distinct, distinguish persistence vs collection expansion vs
+    deepening/refinement vs broadening/shifting from the semantic relations in the window.
+12. confidence reflects confidence in the trajectory abstraction, from 0.0 to 1.0.
+13. Return JSON only. No markdown.
 
 Return exactly:
 {{
@@ -202,6 +284,108 @@ Return exactly:
   "confidence": 0.0
 }}
 """
+
+
+
+def enforce_structural_consistency(
+    mechanism: str,
+    scope: str,
+    direction: str,
+    interaction_sequence: List[Dict[str, Any]],
+) -> Tuple[str, str, str, List[str], Dict[str, Any]]:
+    """
+    Deterministic guardrail for labels with literal structural meaning.
+
+    We do NOT try to infer deepening/collection-expansion automatically.
+    We only prevent impossible repetition/same-item/repeat labels when no
+    exact item_id repeats. This keeps semantic interpretation with Gemma while
+    protecting the Tree from taxonomy collapse.
+    """
+    item_ids = [
+        str(x.get("item_id", "")).strip()
+        for x in interaction_sequence
+        if str(x.get("item_id", "")).strip()
+    ]
+    unique_ids = set(item_ids)
+    has_exact_repeat = (
+        len(item_ids) >= 2
+        and len(unique_ids) < len(item_ids)
+    )
+    all_same_item = (
+        len(item_ids) >= 2
+        and len(unique_ids) == 1
+    )
+
+    categories = [
+        str(x.get("item_category", "")).strip()
+        for x in interaction_sequence
+        if str(x.get("item_category", "")).strip()
+        and str(x.get("item_category", "")).strip().lower() != "unknown"
+    ]
+    same_known_category = (
+        len(categories) >= 2
+        and len(set(categories)) == 1
+    )
+
+    adjustments: List[str] = []
+
+    mechanism = str(mechanism or "unknown").strip().lower()
+    scope = str(scope or "unknown").strip().lower()
+    direction = str(direction or "unknown").strip().lower()
+
+    if not has_exact_repeat:
+        if mechanism == "repetition":
+            old = mechanism
+            # Do not guess persistence/deepening here. The item category can be
+            # too broad (e.g., all CDs), so an impossible literal repetition is
+            # converted to unknown and exposed for audit.
+            mechanism = "unknown"
+            adjustments.append(
+                f"mechanism:{old}->{mechanism}:no_exact_item_repeat"
+            )
+
+        if scope == "same item":
+            old = scope
+            scope = "mixed"
+            adjustments.append(
+                f"scope:{old}->{scope}:no_exact_item_repeat"
+            )
+
+        if direction == "repeat":
+            old = direction
+            direction = "unknown"
+            adjustments.append(
+                f"direction:{old}->{direction}:no_exact_item_repeat"
+            )
+
+    # If every observed interaction is literally the same item, these labels
+    # have unambiguous structural support.
+    if all_same_item:
+        if mechanism in {"unknown", "persistence"}:
+            adjustments.append(
+                f"mechanism:{mechanism}->repetition:all_same_item"
+            )
+            mechanism = "repetition"
+        if scope != "same item":
+            adjustments.append(
+                f"scope:{scope}->same item:all_same_item"
+            )
+            scope = "same item"
+        if direction in {"unknown", "stable"}:
+            adjustments.append(
+                f"direction:{direction}->repeat:all_same_item"
+            )
+            direction = "repeat"
+
+    evidence = {
+        "num_items": len(item_ids),
+        "num_unique_item_ids": len(unique_ids),
+        "has_exact_item_repeat": bool(has_exact_repeat),
+        "all_same_item": bool(all_same_item),
+        "same_known_category": bool(same_known_category),
+    }
+
+    return mechanism, scope, direction, adjustments, evidence
 
 
 def parse_json_response(text: str) -> Dict[str, Any]:
@@ -365,6 +549,7 @@ def build_windows_for_user(
 
         interaction_summary = [
             {
+                "item_id": x["item_id"],
                 "item": x["item_name"],
                 "category": x["item_category"],
                 "action": x["action_type"],
@@ -924,6 +1109,8 @@ def main() -> None:
     total_input_tokens = 0
     total_output_tokens = 0
     parse_failures = 0
+    consistency_adjustment_records = 0
+    consistency_adjustment_events = 0
     produced = 0
 
     batch_starts = range(
@@ -1053,6 +1240,21 @@ def main() -> None:
                     min(1.0, confidence),
                 )
 
+                (
+                    mechanism,
+                    scope,
+                    direction,
+                    consistency_adjustments,
+                    structural_evidence,
+                ) = enforce_structural_consistency(
+                    mechanism=mechanism,
+                    scope=scope,
+                    direction=direction,
+                    interaction_sequence=rec[
+                        "interaction_sequence"
+                    ],
+                )
+
                 if not recommendation_behavior:
                     raise ValueError(
                         "Missing recommendation_behavior"
@@ -1121,6 +1323,21 @@ def main() -> None:
                 scope = "unknown"
                 direction = "unknown"
                 confidence = 0.0
+                consistency_adjustments = []
+                structural_evidence = {
+                    "num_items": len(
+                        rec["interaction_sequence"]
+                    ),
+                    "num_unique_item_ids": len({
+                        str(x.get("item_id"))
+                        for x in rec[
+                            "interaction_sequence"
+                        ]
+                    }),
+                    "has_exact_item_repeat": False,
+                    "all_same_item": False,
+                    "same_known_category": False,
+                }
 
                 parse_ok = False
                 parse_error = repr(exc)
@@ -1190,6 +1407,12 @@ def main() -> None:
                 "scope": scope,
                 "direction": direction,
                 "confidence": confidence,
+                "consistency_adjustments": (
+                    consistency_adjustments
+                ),
+                "structural_evidence": (
+                    structural_evidence
+                ),
 
                 # Backward-compatible aliases used by existing AMem code.
                 "pattern_description": (
@@ -1203,6 +1426,12 @@ def main() -> None:
                 # Useful for auditing/debugging Gemma extraction.
                 "raw_response": response,
             }
+
+            if consistency_adjustments:
+                consistency_adjustment_records += 1
+                consistency_adjustment_events += len(
+                    consistency_adjustments
+                )
 
             # Intentionally NO "embedding" field.
             output_records.append(
@@ -1261,6 +1490,12 @@ def main() -> None:
         "parse_failures_this_run": (
             parse_failures
         ),
+        "consistency_adjustment_records": int(
+            consistency_adjustment_records
+        ),
+        "consistency_adjustment_events": int(
+            consistency_adjustment_events
+        ),
         "llm_inference_time_sec": round(
             total_llm_time,
             4,
@@ -1285,6 +1520,10 @@ def main() -> None:
     print(f"Metadata        : {metadata_path}")
     print(f"New records     : {produced}")
     print(f"Parse failures  : {parse_failures}")
+    print(
+        f"Consistency fix : {consistency_adjustment_records} records / "
+        f"{consistency_adjustment_events} label adjustments"
+    )
     print(f"Gemma time      : {total_llm_time:.2f} sec")
     print("Embeddings      : NOT computed / NOT stored")
     print("\nNext stage:")
