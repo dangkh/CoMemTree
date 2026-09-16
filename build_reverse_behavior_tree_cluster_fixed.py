@@ -32,7 +32,8 @@ Important separation
   stored in the tree is an abstract behavior descriptor, not a content-specific
   medoid sentence (so names such as artists/albums do not leak into ranking).
 
-No LLM verifier is called by this script.
+A batched Gemma structuring step is used when the input lacks structured behavior fields.
+The structured outputs are cached and reused on later runs. No LLM verifier is used for KMeans assignment.
 
 Outputs
 -------
@@ -50,7 +51,8 @@ Example
 python build_reverse_behavior_tree_cluster_fixed.py \
   --input precomputed/CDs/local_memories_gemma.jsonl \
   --output-dir behavior_tree_out_cluster_k50_fixed \
-  --cluster-text-field pattern_description \
+  --cluster-text-field behavior_signature \
+  --behavior-structuring auto \
   --num-clusters 50 \
   --cluster-mode constrained \
   --min-cluster-similarity 0.55 \
@@ -336,6 +338,14 @@ def load_memories(
                 x,
                 cluster_text_field,
             )
+            # Raw local_memories_gemma.jsonl does not contain behavior_signature.
+            # Keep the record so the structuring stage can create it, then
+            # cluster_text will be recomputed before embedding.
+            if not cluster_text and cluster_text_field == "behavior_signature":
+                cluster_text = clean_text(
+                    x.get("pattern_description")
+                    or x.get("behavior_explanation")
+                )
             if not cluster_text:
                 if skip_invalid:
                     print(
@@ -364,6 +374,295 @@ def load_memories(
 
     return rows
 
+
+
+# =============================================================================
+# Structured behavior abstraction
+# =============================================================================
+
+MECHANISM_LABELS = {
+    "repetition", "persistence", "collection expansion", "deepening",
+    "narrowing", "broadening", "adjacent exploration",
+    "cross category exploration", "switching", "refinement", "mixed", "unknown",
+}
+SCOPE_LABELS = {
+    "same item", "same creator", "same series", "same subcategory",
+    "same category", "adjacent category", "cross category", "unknown",
+}
+DIRECTION_LABELS = {
+    "stable", "repeat", "deepen", "narrow", "broaden", "shift", "mixed", "unknown",
+}
+
+
+def _canonical_choice(x: Any, allowed: Set[str], aliases: Optional[Dict[str, str]] = None) -> str:
+    s = normalize_behavior_value(x)
+    if aliases:
+        s = aliases.get(s, s)
+    return s if s in allowed else "unknown"
+
+
+def canonical_mechanism(x: Any) -> str:
+    return _canonical_choice(x, MECHANISM_LABELS, {
+        "collection completion": "collection expansion",
+        "completion": "collection expansion",
+        "preference deepening": "deepening",
+        "preference refinement": "refinement",
+        "adjacent category exploration": "adjacent exploration",
+        "cross category diversification": "cross category exploration",
+        "cross category broadening": "cross category exploration",
+        "repeat": "repetition",
+    })
+
+
+def canonical_scope(x: Any) -> str:
+    return _canonical_choice(x, SCOPE_LABELS, {
+        "same artist": "same creator",
+        "same artists": "same creator",
+        "same series collection": "same series",
+        "same collection": "same series",
+        "same broad category": "same category",
+        "related category": "adjacent category",
+        "different categories": "cross category",
+        "cross categories": "cross category",
+    })
+
+
+def canonical_direction(x: Any) -> str:
+    return _canonical_choice(x, DIRECTION_LABELS, {
+        "repetition": "repeat", "deepening": "deepen", "narrowing": "narrow",
+        "broadening": "broaden", "switch": "shift", "switching": "shift",
+        "persist": "stable", "persistence": "stable",
+    })
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    s = str(text or "").strip()
+    if "```json" in s:
+        s = s.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in s:
+        s = s.split("```", 1)[1].split("```", 1)[0].strip()
+    a, b = s.find("{"), s.rfind("}")
+    if a >= 0 and b > a:
+        s = s[a:b + 1]
+    obj = json.loads(s)
+    if not isinstance(obj, dict):
+        raise ValueError("structured behavior output is not a JSON object")
+    return obj
+
+
+def _raw_memory_for_structuring(m: Dict[str, Any]) -> str:
+    pattern = clean_text(m.get("pattern_description"))
+    explanation = clean_text(m.get("behavior_explanation"))
+    return clean_text(f"Behavior pattern: {pattern}. Evidence summary: {explanation}")
+
+
+class BatchedGemmaBehaviorStructurer:
+    def __init__(self, model_name: str, max_seq_length: int, load_in_4bit: bool) -> None:
+        try:
+            import torch
+            from unsloth import FastModel
+            from unsloth.chat_templates import get_chat_template
+        except ImportError as e:
+            raise RuntimeError("Structured behavior extraction needs torch + unsloth") from e
+        if not torch.cuda.is_available():
+            raise RuntimeError("Gemma behavior structuring currently requires CUDA")
+        self.torch = torch
+        print(f"[INFO] loading Gemma behavior structurer: {model_name}")
+        self.model, self.tokenizer = FastModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=max_seq_length,
+            load_in_4bit=load_in_4bit,
+            full_finetuning=False,
+        )
+        self.tokenizer = get_chat_template(self.tokenizer, chat_template="gemma3")
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        try:
+            FastModel.for_inference(self.model)
+        except Exception:
+            pass
+        self.model.eval()
+        self.device = next(self.model.parameters()).device
+
+    def _render(self, m: Dict[str, Any]) -> str:
+        raw = _raw_memory_for_structuring(m)
+        prompt = f'''Convert this recommendation memory into one DOMAIN-AGNOSTIC behavior description.
+
+RAW MEMORY:
+{raw}
+
+Do NOT describe concrete artists, titles, genres, categories, formats, brands, or domains.
+Describe only the temporal/relational behavior.
+
+Choose EXACTLY one label from each list.
+mechanism: repetition | persistence | collection expansion | deepening | narrowing | broadening | adjacent exploration | cross category exploration | switching | refinement | mixed | unknown
+scope: same item | same creator | same series | same subcategory | same category | adjacent category | cross category | unknown
+direction: stable | repeat | deepen | narrow | broaden | shift | mixed | unknown
+
+The signature must be a concise domain-agnostic phrase, ideally <= 12 words.
+Do not infer unsupported behavior.
+
+Return ONLY JSON:
+{{"signature":"...","mechanism":"...","scope":"...","direction":"...","confidence":0.0}}'''
+        messages = [
+            {"role": "system", "content": "You extract structured domain-agnostic recommendation behaviors. Return valid JSON only."},
+            {"role": "user", "content": prompt},
+        ]
+        rendered = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        if rendered.startswith("<bos>"):
+            rendered = rendered[len("<bos>"):]
+        return rendered
+
+    def generate_batch(self, memories: List[Dict[str, Any]], max_new_tokens: int) -> List[Dict[str, Any]]:
+        if not memories:
+            return []
+        rendered = [self._render(m) for m in memories]
+        enc = self.tokenizer(rendered, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        input_width = int(enc["input_ids"].shape[1])
+        with self.torch.inference_mode():
+            out = self.model.generate(
+                **enc,
+                max_new_tokens=int(max_new_tokens),
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        texts = self.tokenizer.batch_decode(out[:, input_width:], skip_special_tokens=True)
+        results: List[Dict[str, Any]] = []
+        for m, raw in zip(memories, texts):
+            try:
+                obj = _extract_json_object(raw)
+                sig = clean_text(obj.get("signature"))
+                if not sig:
+                    raise ValueError("empty behavior signature")
+                mech = canonical_mechanism(obj.get("mechanism"))
+                scope = canonical_scope(obj.get("scope"))
+                direction = canonical_direction(obj.get("direction"))
+                confidence = max(0.0, min(1.0, float(obj.get("confidence", 0.5))))
+                results.append({
+                    "signature": sig,
+                    "mechanism": mech,
+                    "scope": scope,
+                    "direction": direction,
+                    "confidence": confidence,
+                    "parse_ok": bool(mech != "unknown" and scope != "unknown"),
+                    "raw_llm_output": raw,
+                })
+            except Exception as e:
+                results.append({
+                    "signature": clean_text(m.get("pattern_description")) or "unknown behavior",
+                    "mechanism": "unknown", "scope": "unknown", "direction": "unknown",
+                    "confidence": 0.0, "parse_ok": False,
+                    "parse_error": repr(e), "raw_llm_output": raw,
+                })
+        return results
+
+
+def _load_structured_cache(path: Path) -> Dict[str, Dict[str, Any]]:
+    cache: Dict[str, Dict[str, Any]] = {}
+    if not path.exists():
+        return cache
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                mid = str(row.get("memory_id") or "")
+                if mid and row.get("signature"):
+                    cache[mid] = row
+            except Exception:
+                continue
+    return cache
+
+
+def ensure_structured_behaviors(memories: List[Dict[str, Any]], args: argparse.Namespace, out_dir: Path) -> Dict[str, Any]:
+    cache_path = Path(args.structured_cache) if args.structured_cache else out_dir / "structured_behavior_inputs.jsonl"
+    cache = {} if args.force_restructure else _load_structured_cache(cache_path)
+    rows_by_mid: Dict[str, Dict[str, Any]] = {}
+    pending: List[Dict[str, Any]] = []
+
+    for m in memories:
+        mid = str(m["memory_id"])
+        already = bool(
+            clean_text(m.get("behavior_signature"))
+            and canonical_mechanism(m.get("mechanism")) != "unknown"
+            and canonical_scope(m.get("scope")) != "unknown"
+        )
+        if args.behavior_structuring == "none":
+            if not already:
+                raise ValueError("--behavior-structuring none requires structured fields in every input record")
+        if already and args.behavior_structuring in {"auto", "none"}:
+            rows_by_mid[mid] = {
+                "memory_id": mid,
+                "signature": clean_text(m.get("behavior_signature")),
+                "mechanism": canonical_mechanism(m.get("mechanism")),
+                "scope": canonical_scope(m.get("scope")),
+                "direction": canonical_direction(m.get("direction")),
+                "confidence": float(m.get("confidence", 1.0) or 1.0),
+                "parse_ok": True, "source": "input",
+            }
+        elif mid in cache and not args.force_restructure:
+            rows_by_mid[mid] = cache[mid]
+        else:
+            pending.append(m)
+
+    if pending:
+        structurer = BatchedGemmaBehaviorStructurer(
+            args.structuring_model, args.structuring_max_seq_length, args.structuring_load_in_4bit
+        )
+        bs = max(1, int(args.structuring_batch_size))
+        for start in range(0, len(pending), bs):
+            batch = pending[start:start + bs]
+            results = structurer.generate_batch(batch, args.structuring_max_new_tokens)
+            for m, r in zip(batch, results):
+                rows_by_mid[str(m["memory_id"])] = {
+                    "memory_id": m["memory_id"], "user_id": m["user_id"],
+                    "window_index": int(m["window_index"]), **r, "source": "gemma_structuring",
+                }
+            print(f"      structured {min(start + bs, len(pending))}/{len(pending)} new memories", end="\r", flush=True)
+        print()
+
+    ordered_rows: List[Dict[str, Any]] = []
+    parse_fail = 0
+    unknown = 0
+    for m in memories:
+        row = rows_by_mid[str(m["memory_id"])]
+        m["behavior_signature"] = clean_text(row.get("signature"))
+        m["mechanism"] = canonical_mechanism(row.get("mechanism"))
+        m["scope"] = canonical_scope(row.get("scope"))
+        m["direction"] = canonical_direction(row.get("direction"))
+        try:
+            m["confidence"] = float(row.get("confidence", 0.0) or 0.0)
+        except Exception:
+            m["confidence"] = 0.0
+        m["behavior_profile"] = behavior_profile(m)
+        m["behavior_bucket_key"] = list(behavior_bucket_key(m))
+        m["cluster_text"] = choose_cluster_text(m, args.cluster_text_field)
+        parse_fail += int(not row.get("parse_ok", False))
+        unknown += int("unknown" in behavior_bucket_key(m))
+        ordered_rows.append(row)
+
+    jsonl_dump(ordered_rows, cache_path)
+    unique_buckets = sorted(set(behavior_bucket_key(m) for m in memories))
+    if args.cluster_mode == "constrained":
+        if len(unique_buckets) == 1 and unique_buckets[0] == ("unknown", "unknown", "unknown"):
+            raise RuntimeError("All memories are unknown|unknown|unknown after structuring; refusing constrained KMeans")
+        known_count = sum(1 for m in memories if "unknown" not in behavior_bucket_key(m))
+        if known_count == 0:
+            raise RuntimeError("No usable structured behavior records for constrained KMeans")
+
+    return {
+        "cache_path": str(cache_path),
+        "newly_structured": len(pending),
+        "cached_or_input": len(memories) - len(pending),
+        "parse_failure_count": parse_fail,
+        "unknown_profile_count": unknown,
+        "unknown_profile_ratio": float(unknown / len(memories)),
+        "num_behavior_buckets_before_clustering": len(unique_buckets),
+    }
 
 # =============================================================================
 # Embeddings
@@ -1376,6 +1675,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exclude-users", default=None)
     p.add_argument("--strict-input", action="store_true")
 
+
+    p.add_argument("--behavior-structuring", choices=["auto", "gemma", "none"], default="auto")
+    p.add_argument("--structuring-model", default="unsloth/gemma-3-4b-it-unsloth-bnb-4bit")
+    p.add_argument("--structuring-batch-size", type=int, default=8)
+    p.add_argument("--structuring-max-new-tokens", type=int, default=128)
+    p.add_argument("--structuring-max-seq-length", type=int, default=2048)
+    p.add_argument("--structuring-load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--structured-cache", default=None)
+    p.add_argument("--force-restructure", action="store_true")
+
     p.add_argument(
         "--cluster-text-field",
         choices=[
@@ -1383,10 +1692,10 @@ def parse_args() -> argparse.Namespace:
             "behavior_signature",
             "combined",
         ],
-        default="pattern_description",
+        default="behavior_signature",
         help=(
-            "Text embedded for KMeans. For the controlled Gemma ablation, "
-            "pattern_description is the default."
+            "Text embedded for KMeans. behavior_signature is recommended after "
+            "the structured abstraction step to avoid content leakage."
         ),
     )
 
@@ -1558,7 +1867,14 @@ def main() -> None:
         f"{args.cluster_text_field}"
     )
 
-    print("[2/8] Save cluster inputs")
+    print("[2/9] Ensure structured domain-agnostic behaviors")
+    structuring_stats = ensure_structured_behaviors(memories, args, out_dir)
+    print(
+        f"      behavior_buckets={structuring_stats['num_behavior_buckets_before_clustering']} "
+        f"unknown_profile_ratio={structuring_stats['unknown_profile_ratio']:.3f}"
+    )
+
+    print("[3/9] Save cluster inputs")
     jsonl_dump(
         [
             {
@@ -1587,7 +1903,7 @@ def main() -> None:
         out_dir / "cluster_behavior_inputs.jsonl",
     )
 
-    print("[3/8] Embed Gemma behavior text")
+    print("[4/9] Embed structured behavior text")
     embeddings = create_embeddings(
         args,
         memories,
@@ -1598,7 +1914,7 @@ def main() -> None:
     )
 
     print(
-        f"[4/8] KMeans state induction "
+        f"[5/9] KMeans state induction "
         f"(mode={args.cluster_mode}, requested_K={args.num_clusters})"
     )
     labels, centers, inertia, cluster_meta, cluster_info = run_kmeans(
@@ -1692,6 +2008,7 @@ def main() -> None:
             "effective_num_clusters": cluster_info["effective_num_clusters"],
             "cluster_mode": args.cluster_mode,
             "constraint_fields": ["mechanism", "scope", "direction"],
+            "behavior_structuring": structuring_stats,
             "cluster_info": cluster_info,
             "cluster_text_field": (
                 args.cluster_text_field
@@ -1768,7 +2085,7 @@ def main() -> None:
         out_dir / "memory_state_assignments.jsonl",
     )
 
-    print("[5/8] Reconstruct ordered cluster-state sequences")
+    print("[6/9] Reconstruct ordered cluster-state sequences")
     user_sequences = build_user_sequences(
         memories,
         idx_to_state,
@@ -1816,7 +2133,7 @@ def main() -> None:
         )
 
     print(
-        "[6/8] Generate overlapping "
+        "[7/9] Generate overlapping "
         "context -> next observations"
     )
     ctx_stats = accumulate_contexts(
@@ -1832,7 +2149,7 @@ def main() -> None:
     )
 
     print(
-        "[7/8] Estimate collaborative next distributions "
+        "[8/9] Estimate collaborative next distributions "
         "+ suffix smoothing"
     )
     records = build_context_records(
@@ -1862,7 +2179,7 @@ def main() -> None:
         out_dir / "context_observations.jsonl",
     )
 
-    print("[8/8] Build ONE physical reverse suffix tree")
+    print("[9/9] Build ONE physical reverse suffix tree")
     tree = build_reverse_tree(records)
     validate_tree_structure(
         tree,
