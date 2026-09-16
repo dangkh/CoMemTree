@@ -123,7 +123,7 @@ python precompute_test_behaviors_gemma_batch.py \
   --sequences data/CDs/user_sequences_10_5000.json \
   --model unsloth/gemma-3-4b-it-unsloth-bnb-4bit \
   --window-size 3 \
-  --max-train-interactions 30 \
+  --max-train-interactions 10 \
   --batch-size 8 \
   --recent-behaviors 5 \
   --max-users 300 \
