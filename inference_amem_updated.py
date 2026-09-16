@@ -161,9 +161,12 @@ class LocalRanker:
 
         self.model.eval()
         self.device = next(self.model.parameters()).device
-        self.max_new_tokens = max_new_tokens
+        self.max_new_tokens = int(max_new_tokens)
         self.max_seq_length = int(max_seq_length)
+
+        # calls = number of model.generate() invocations, not number of users.
         self.calls = 0
+        self.samples = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self.total_time = 0.0
@@ -203,13 +206,12 @@ Requirements:
 
 {{"ranked_item_ids": ["id1", "..."], "reasoning": "1 concise sentence"}}"""
 
-    def rank(self, user_id: str, user_profile, candidates, memory_thoughts):
+    def _render_prompt(self, user_profile, candidates, memory_thoughts) -> str:
         prompt = self.build_prompt(user_profile, candidates, memory_thoughts)
         messages = [
             {"role": "system", "content": "You are a recommendation ranking system."},
             {"role": "user", "content": prompt},
         ]
-
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -217,45 +219,10 @@ Requirements:
         )
         if text.startswith("<bos>"):
             text = text[len("<bos>"):]
+        return text
 
-        inputs = self.tokenizer(
-            [text],
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_seq_length,
-        ).to(self.device)
-        n_in = int(inputs["input_ids"].shape[-1])
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
-
-        gen = outputs[0][n_in:]
-        response = self.tokenizer.decode(gen, skip_special_tokens=True)
-
-        self.calls += 1
-        self.input_tokens += n_in
-        self.output_tokens += len(gen)
-        self.total_time += elapsed
-        self.records.append({
-            "user_id": str(user_id),
-            "input_tokens": n_in,
-            "output_tokens": int(len(gen)),
-            "inference_time_sec": round(elapsed, 4),
-        })
-
+    @staticmethod
+    def _clean_prediction(response: str, candidates, user_id: str):
         valid_ids = [str(x["item_id"]) for x in candidates]
         valid_set = set(valid_ids)
 
@@ -271,36 +238,153 @@ Requirements:
                 if iid not in seen:
                     cleaned.append(iid)
                     seen.add(iid)
-            return cleaned, str(obj.get("reasoning", ""))
+            return cleaned, str(obj.get("reasoning", "")), True
         except Exception as e:
+            # Keep the same deterministic fallback as the single-user baseline:
+            # preserve the canonical candidate-cache order.
             print(f"Warning: parse failed for user {user_id}: {e}")
-            return valid_ids, ""
+            return valid_ids, "", False
+
+    def rank_batch(self, jobs: List[Dict[str, Any]], batch_size: int = 8):
+        """
+        Rank independent users in GPU batches.
+
+        Each job keeps its own prompt/history/candidates. Users are never merged
+        into one prompt; batching only packs independent prompts into one
+        model.generate() call.
+        """
+        if not jobs:
+            return []
+
+        batch_size = max(1, int(batch_size))
+        all_results = []
+
+        for start in range(0, len(jobs), batch_size):
+            chunk = jobs[start:start + batch_size]
+            texts = [
+                self._render_prompt(
+                    j["user_profile"],
+                    j["candidates"],
+                    j.get("memory_thoughts"),
+                )
+                for j in chunk
+            ]
+
+            inputs = self.tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_length,
+            ).to(self.device)
+
+            # With left padding, generated tokens begin after the common padded
+            # input width for every sample in the batch.
+            input_width = int(inputs["input_ids"].shape[1])
+            per_sample_input_tokens = [
+                int(x) for x in inputs["attention_mask"].sum(dim=1).tolist()
+            ]
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
+
+            generated = outputs[:, input_width:]
+            responses = self.tokenizer.batch_decode(
+                generated,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+
+            self.calls += 1
+            self.samples += len(chunk)
+            self.total_time += elapsed
+            self.input_tokens += sum(per_sample_input_tokens)
+
+            for local_idx, (job, response) in enumerate(zip(chunk, responses)):
+                # Generated tensors are padded to a common width. Count only
+                # non-pad generated tokens for tracking.
+                gen_row = generated[local_idx]
+                if self.tokenizer.pad_token_id is None:
+                    n_out = int(gen_row.numel())
+                else:
+                    n_out = int((gen_row != self.tokenizer.pad_token_id).sum().item())
+                self.output_tokens += n_out
+
+                pred, reasoning, parse_ok = self._clean_prediction(
+                    response.strip(),
+                    job["candidates"],
+                    job["user_id"],
+                )
+
+                self.records.append({
+                    "user_id": str(job["user_id"]),
+                    "batch_size": len(chunk),
+                    "input_tokens": per_sample_input_tokens[local_idx],
+                    "output_tokens": n_out,
+                    "batch_inference_time_sec": round(elapsed, 4),
+                    "approx_inference_time_per_sample_sec": round(elapsed / len(chunk), 4),
+                    "parse_ok": bool(parse_ok),
+                })
+
+                all_results.append((pred, reasoning))
+
+        return all_results
+
+    def rank(self, user_id: str, user_profile, candidates, memory_thoughts):
+        """Compatibility wrapper for batch_size=1."""
+        return self.rank_batch(
+            [{
+                "user_id": str(user_id),
+                "user_profile": user_profile,
+                "candidates": candidates,
+                "memory_thoughts": memory_thoughts,
+            }],
+            batch_size=1,
+        )[0]
 
     def stats(self):
         return {
-            "calls": self.calls,
+            "generate_calls": self.calls,
+            "samples": self.samples,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.input_tokens + self.output_tokens,
             "total_inference_time_sec": round(self.total_time, 4),
-            "avg_inference_time_sec": (
+            "avg_generate_call_time_sec": (
                 round(self.total_time / self.calls, 4) if self.calls else 0.0
+            ),
+            "avg_sample_time_sec": (
+                round(self.total_time / self.samples, 4) if self.samples else 0.0
             ),
         }
 
-
-def run_one_user(
+def prepare_one_user(
     user_id: str,
     user_data: Dict[str, Any],
     neg_data: Dict[str, Any],
     items_meta: Dict[str, Any],
     retriever: Optional[FlatMemoryRetriever],
-    ranker: LocalRanker,
     k_memories: int,
     history_size: int,
     seed: int,
     candidate_row: Optional[Dict[str, Any]] = None,
 ):
+    """Prepare one independent ranking job without calling Gemma."""
     train_ids = [str(x) for x in user_data.get("train", [])]
     test_ids = [str(x) for x in user_data.get("test", [])]
     neg_ids = [str(x) for x in neg_data.get("test_neg", [])]
@@ -351,24 +435,32 @@ def run_one_user(
                 "similarity": round(float(s), 4),
             })
 
-    pred, reasoning = ranker.rank(
-        user_id=user_id,
-        user_profile=history,
-        candidates=candidates,
-        memory_thoughts=memory_thoughts or None,
-    )
-
     return {
         "user_id": str(user_id),
         "ground_truth_item_ids": test_ids,
         "candidate_item_ids": candidate_ids,
-        "reranked_item_ids": pred,
         "candidate_items": candidates,
-        "reranked_items": [get_item_info(i, items_meta) for i in pred],
+        "history": history,
         "retrieved_memories": memory_thoughts,
-        "ranking_reasoning": reasoning,
     }
 
+
+def finalize_one_user(
+    prepared: Dict[str, Any],
+    pred: List[str],
+    reasoning: str,
+    items_meta: Dict[str, Any],
+):
+    return {
+        "user_id": prepared["user_id"],
+        "ground_truth_item_ids": prepared["ground_truth_item_ids"],
+        "candidate_item_ids": prepared["candidate_item_ids"],
+        "reranked_item_ids": pred,
+        "candidate_items": prepared["candidate_items"],
+        "reranked_items": [get_item_info(i, items_meta) for i in pred],
+        "retrieved_memories": prepared["retrieved_memories"],
+        "ranking_reasoning": reasoning,
+    }
 
 def load_candidate_file(path: str) -> Dict[str, Dict[str, Any]]:
     obj = load_json(path)
@@ -518,6 +610,13 @@ def parse_args():
     p.add_argument("--start_user", type=int, default=0)
     p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--max_seq_length", type=int, default=8192)
+    p.add_argument(
+        "--llm_batch_size", "--llm-batch-size",
+        dest="llm_batch_size",
+        type=int,
+        default=8,
+        help="Independent user prompts per model.generate() call. Lower to 4/2 if GPU OOM.",
+    )
     p.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--save_every", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
@@ -605,27 +704,73 @@ def main():
 
     t0 = time.perf_counter()
 
-    for step, uid in enumerate(tqdm(pending, desc="Inference"), start=1):
-        try:
-            result = run_one_user(
-                user_id=str(uid),
-                user_data=sequences[uid],
-                neg_data=negatives.get(uid, {}),
-                items_meta=items_meta,
-                retriever=retriever,
-                ranker=ranker,
-                k_memories=args.k_memories,
-                history_size=args.history_size,
-                seed=args.seed,
-                candidate_row=candidate_rows[str(uid)],
-            )
-            results.append(result)
-        except Exception as e:
-            print(f"\nWarning: user {uid} failed: {e}")
-            continue
+    batch_size = max(1, int(args.llm_batch_size))
+    print(f"LLM batch size: {batch_size}")
+    pbar = tqdm(total=len(pending), desc="Inference", unit="user")
+    processed_since_save = 0
 
-        if args.save_every > 0 and step % args.save_every == 0:
+    for batch_start in range(0, len(pending), batch_size):
+        batch_uids = pending[batch_start:batch_start + batch_size]
+        prepared_batch = []
+
+        # Preparation/retrieval remains per-user; only Gemma ranking is batched.
+        for uid in batch_uids:
+            try:
+                prepared = prepare_one_user(
+                    user_id=str(uid),
+                    user_data=sequences[uid],
+                    neg_data=negatives.get(uid, {}),
+                    items_meta=items_meta,
+                    retriever=retriever,
+                    k_memories=args.k_memories,
+                    history_size=args.history_size,
+                    seed=args.seed,
+                    candidate_row=candidate_rows[str(uid)],
+                )
+                prepared_batch.append(prepared)
+            except Exception as e:
+                print(f"\nWarning: user {uid} failed during preparation: {e}")
+
+        if prepared_batch:
+            jobs = [
+                {
+                    "user_id": x["user_id"],
+                    "user_profile": x["history"],
+                    "candidates": x["candidate_items"],
+                    "memory_thoughts": x["retrieved_memories"] or None,
+                }
+                for x in prepared_batch
+            ]
+
+            try:
+                ranked_batch = ranker.rank_batch(
+                    jobs,
+                    batch_size=batch_size,
+                )
+            except torch.cuda.OutOfMemoryError:
+                raise RuntimeError(
+                    f"CUDA OOM with --llm_batch_size {batch_size}. "
+                    "Retry with --llm_batch_size 4, 2, or 1."
+                )
+
+            for prepared, (pred, reasoning) in zip(prepared_batch, ranked_batch):
+                results.append(
+                    finalize_one_user(
+                        prepared=prepared,
+                        pred=pred,
+                        reasoning=reasoning,
+                        items_meta=items_meta,
+                    )
+                )
+                processed_since_save += 1
+
+        pbar.update(len(batch_uids))
+
+        if args.save_every > 0 and processed_since_save >= args.save_every:
             save_json_atomic(results, output)
+            processed_since_save = 0
+
+    pbar.close()
 
     save_json_atomic(results, output)
 
@@ -636,6 +781,7 @@ def main():
         "use_memory": not args.no_memory,
         "k_memories": args.k_memories,
         "history_size": args.history_size,
+        "llm_batch_size": args.llm_batch_size,
         "candidate_file": args.candidate_file,
         "ranking_model": args.model_name,
         "embedding_model": args.embedding_model,
