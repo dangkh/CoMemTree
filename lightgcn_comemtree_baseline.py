@@ -25,7 +25,9 @@ STRICT FAIRNESS DEFAULTS
    --expected-candidates=20 enforces 1 GT + 19 negatives.
 
 5) LightGCN uses only IDs/interactions. Item metadata is NOT used for scoring.
-   --items is used only to define the catalog/item embedding table.
+   --items defines the known metadata catalog. Evaluation items absent from both
+   the catalog and selected-user training graph are handled as strict cold-start
+   items with a zero embedding only AFTER the model is frozen.
 
 Outputs
 -------
@@ -724,25 +726,38 @@ def main(args: argparse.Namespace) -> None:
         candidates = [str(x) for x in row["candidates"]]
         targets = [str(x) for x in row["targets"]]
 
-        missing_from_train_catalog = [
+        # Strict no-leakage cold-start handling.
+        #
+        # Some evaluation candidates may not exist in items.json and may never
+        # occur in the selected users' TRAIN graph. CoMemTree still allows these
+        # item IDs (metadata simply falls back to "Item <id>").
+        #
+        # We MUST NOT add held-out candidate IDs to the LightGCN graph before
+        # fitting merely to make them scoreable. Instead, after the model is
+        # frozen, an unseen item is represented by a zero vector, hence dot
+        # product score = 0.0. This is deterministic and uses no test signal.
+        known_positions = [
+            j for j, iid in enumerate(candidates) if iid in item_to_idx
+        ]
+        score_values = [0.0] * len(candidates)
+
+        if known_positions:
+            known_item_indices = torch.tensor(
+                [item_to_idx[candidates[j]] for j in known_positions],
+                dtype=torch.long,
+                device=device,
+            )
+            known_scores = torch.mv(
+                item_final[known_item_indices],
+                user_final[uidx],
+            ).detach().cpu().tolist()
+
+            for j, s in zip(known_positions, known_scores):
+                score_values[j] = float(s)
+
+        cold_start_candidates = [
             iid for iid in candidates if iid not in item_to_idx
         ]
-        if missing_from_train_catalog:
-            raise ValueError(
-                f"user={uid}: evaluation candidate(s) missing from items.json/"
-                f"train-time catalog: {missing_from_train_catalog[:5]}. "
-                "Do not add them from test data before training; fix the dataset "
-                "catalog instead."
-            )
-
-        cidx = torch.tensor(
-            [item_to_idx[iid] for iid in candidates],
-            dtype=torch.long,
-            device=device,
-        )
-
-        scores = torch.mv(item_final[cidx], user_final[uidx])
-        score_values = scores.detach().cpu().tolist()
 
         # Stable deterministic tie-break: preserve original candidate order.
         order = sorted(
@@ -769,12 +784,40 @@ def main(args: argparse.Namespace) -> None:
                 "targets": targets,
                 "candidates": candidates,
                 "scores_in_candidate_order": score_values,
+                "cold_start_candidates": cold_start_candidates,
+                "n_cold_start_candidates": len(cold_start_candidates),
+                "target_is_cold_start": any(
+                    t not in item_to_idx for t in targets
+                ),
                 "ranked_candidates": ranked_candidates,
                 "rank_position": rank,
             }
         )
 
     metrics = compute_metrics(ranks, ks=[1, 3, 5, 10, 15, 20])
+
+    total_eval_candidates = sum(len(r["candidates"]) for r in ranking_rows)
+    total_cold_start = sum(
+        int(r["n_cold_start_candidates"]) for r in ranking_rows
+    )
+    cold_start_targets = sum(
+        bool(r["target_is_cold_start"]) for r in ranking_rows
+    )
+
+    cold_start_stats = {
+        "n_eval_candidates": total_eval_candidates,
+        "n_cold_start_candidates": total_cold_start,
+        "cold_start_candidate_rate": (
+            total_cold_start / total_eval_candidates
+            if total_eval_candidates else 0.0
+        ),
+        "n_cold_start_targets": cold_start_targets,
+        "cold_start_target_rate": (
+            cold_start_targets / len(ranking_rows)
+            if ranking_rows else 0.0
+        ),
+        "cold_start_policy": "zero embedding => score 0.0 after model freeze",
+    }
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -836,10 +879,14 @@ def main(args: argparse.Namespace) -> None:
             "final_loss": losses[-1] if losses else None,
             "min_loss": min(losses) if losses else None,
         },
+        "cold_start": cold_start_stats,
         "metrics": metrics,
     }
 
     save_json(out_dir / "lightgcn_metrics.json", summary)
+
+    print("\nCOLD-START DIAGNOSTICS")
+    print(json.dumps(cold_start_stats, indent=2))
 
     print("\nRESULTS")
     print(json.dumps(metrics, indent=2))
