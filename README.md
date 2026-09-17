@@ -14,15 +14,7 @@ CUDA GPU is required for the local Gemma/Unsloth inference.
 ## 1. Precompute local memories
 
 ```bash
-python precompute_memory_create.py \
-  --data_dir data/CDs \
-  --sequences_file user_sequences_10_5000.json \
-  --items_file items.json \
-  --output precomputed/CDs/local_memories.jsonl \
-  --number_of_users 1000 \
-  --window_size 3 \
-  --llm_batch_size 8 \
-  --max_new_tokens 256
+CUDA_VISIBLE_DEVICES=0 python precompute_memory_create_dual_behavior.py   --data_dir data/Video_Games   --sequences_file user_sequences_10_5000.json   --items_file items.json   --output precomputed/Video_Games/local_memories_gemma_dual_300.jsonl   --model_name unsloth/gemma-3-4b-it-unsloth-bnb-4bit   --number_of_users 300   --window_size 3   --max_train_items 10   --llm_batch_size 8  --max_new_tokens 384   --seed 42   --no-resume
 ```
 
 Use `--number_of_users 0` to process all users.
@@ -84,19 +76,7 @@ python inference_amem.py \
 ## 3. Tree Construction
 Clustering
 ```bash
-python build_reverse_behavior_tree_cluster.py \
-  --input precomputed/CDs/local_memories_gemma.jsonl \
-  --output-dir behavior_tree_out_cluster_k50 \
-  --cluster-text-field pattern_description \
-  --num-clusters 50 \
-  --encoder qwen \
-  --embedding-model Qwen/Qwen3-Embedding-0.6B \
-  --max-order 5 \
-  --count-mode user_normalized \
-  --min-support-users 3 \
-  --min-support-occurrences 3 \
-  --min-jsd 0.05 \
-  --smoothing-kappa 5
+python build_reverse_behavior_tree_dual.py   --input precomputed/CDs/local_memories_gemma_dual_300.jsonl   --output-dir behavior_tree_out_dual_k50   --cluster-text-field structured_combined   --num-clusters 50   --cluster-mode constrained   --constraint-level mechanism   --min-cluster-similarity 0.55   --min-cluster-margin 0.02   --encoder qwen   --embedding-model Qwen/Qwen3-Embedding-0.6B   --device auto   --batch-size 128   --max-order 5   --count-mode user_normalized   --smoothing-kappa 5   --min-support-users 3   --min-support-occurrences 3 --min-jsd 0.05   --top-next 20   --seed 42
 ```
 
 
