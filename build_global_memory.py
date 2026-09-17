@@ -88,7 +88,7 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 
-EXPECTED_PRECOMPUTE_SCHEMA = "amem_local_memory_text_v2"
+EXPECTED_PRECOMPUTE_SCHEMA = "amem_local_memory_dual_behavior_v4"
 
 
 # =============================================================================
