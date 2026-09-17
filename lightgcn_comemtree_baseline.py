@@ -9,11 +9,13 @@ STRICT FAIRNESS DEFAULTS
      --eval-behaviors, preserving sequence-file order;
    - then take --max-users (default: 300).
 
-2) Train only on each selected user's last 10 TRAIN interactions:
+2) Train only on up to each selected user's last 10 TRAIN interactions:
        train[-history_size:]
-   No val/test interaction is used as a positive training edge.
+   A user with fewer than 10 uses all available train interactions.
+   No older-train/val/test information is used by the training loss or sampler.
 
-3) Evaluate on the SAME candidate construction as CoMemTree:
+3) Only AFTER fitting is complete, evaluate on the SAME candidate construction
+   as CoMemTree:
        test_ids + test_neg
        random.Random(f"{seed}:{user_id}").shuffle(candidates)
    Or pass --candidate-file if the CoMemTree run used an explicit frozen
@@ -390,9 +392,9 @@ def sample_negatives(
     """
     One negative per positive edge.
 
-    To avoid contradictory supervision, known train/val/test positives of the
-    SAME user are excluded from negative sampling. Their labels/scores are not
-    otherwise used for fitting.
+    Strict no-leakage rule:
+    only the TRAIN positives actually used to build the graph are excluded.
+    Validation/test/candidate information is never consulted by this sampler.
     """
     neg = np.empty(len(user_indices), dtype=np.int64)
 
@@ -518,11 +520,9 @@ def main(args: argparse.Namespace) -> None:
     )
 
     sequences_raw = load_json(args.sequences)
-    negatives_raw = load_json(args.negatives)
     items_raw = load_json(args.items)
 
     sequences = {str(k): v for k, v in sequences_raw.items()}
-    negatives = {str(k): v for k, v in negatives_raw.items()}
 
     users = select_users(
         sequences=sequences,
@@ -536,9 +536,133 @@ def main(args: argparse.Namespace) -> None:
             f"Expected exactly {args.max_users} users, selected {len(users)}."
         )
 
+    # Build the item universe WITHOUT consulting val/test/candidates.
+    #
+    # `items.json` is treated as the dataset catalog, which is available to all
+    # methods. We may additionally add TRAIN-only IDs in case a train ID is
+    # missing from metadata. Held-out interactions never expand the train-time
+    # item universe.
+    catalog = catalog_item_ids(items_raw)
+    item_ids: List[str] = []
+    seen_items: Set[str] = set()
+
+    def add_item(iid: str) -> None:
+        iid = str(iid)
+        if iid not in seen_items:
+            seen_items.add(iid)
+            item_ids.append(iid)
+
+    for iid in catalog:
+        add_item(iid)
+
+    for uid in users:
+        train_ids_for_catalog = as_str_list(sequences[uid].get("train", []))
+        if args.history_size > 0:
+            train_ids_for_catalog = train_ids_for_catalog[-args.history_size:]
+        for iid in train_ids_for_catalog:
+            add_item(iid)
+
+    user_to_idx = {uid: idx for idx, uid in enumerate(users)}
+    item_to_idx = {iid: idx for idx, iid in enumerate(item_ids)}
+
+    # STRICT training graph: selected users x last history_size TRAIN interactions only.
+    train_edges: List[Tuple[int, int]] = []
+    train_histories: Dict[str, List[str]] = {}
+
+    for uid in users:
+        train_ids = as_str_list(sequences[uid].get("train", []))
+        if args.history_size > 0:
+            train_ids = train_ids[-args.history_size:]
+
+        if not train_ids:
+            raise ValueError(f"user={uid}: no usable train interactions")
+
+        # CoMemTree semantics: history_size is a MAXIMUM cutoff, not an
+        # exact-length requirement. A user with 9 interactions uses all 9.
+        if len(train_ids) > args.history_size:
+            raise AssertionError(
+                f"user={uid}: internal error, history exceeds cutoff "
+                f"{args.history_size}"
+            )
+
+        train_histories[uid] = train_ids
+        uidx = user_to_idx[uid]
+
+        for iid in train_ids:
+            train_edges.append((uidx, item_to_idx[iid]))
+
+    # STRICT NO-LEAKAGE negative-sampling exclusion:
+    # only the exact TRAIN positives used in the graph are known at training.
+    # Do NOT consult:
+    #   - older train interactions outside the history cutoff,
+    #   - validation interactions,
+    #   - test target,
+    #   - test negatives/candidate list.
+    user_forbidden: List[Set[int]] = [set() for _ in users]
+    for uid in users:
+        uidx = user_to_idx[uid]
+        user_forbidden[uidx] = {
+            item_to_idx[iid]
+            for iid in train_histories[uid]
+            if iid in item_to_idx
+        }
+
+    norm_adj = build_normalized_adj(
+        n_users=len(users),
+        n_items=len(item_ids),
+        edges=train_edges,
+        device=device,
+    )
+
+    model = LightGCN(
+        n_users=len(users),
+        n_items=len(item_ids),
+        embedding_dim=args.embedding_dim,
+        n_layers=args.n_layers,
+        norm_adj=norm_adj,
+    ).to(device)
+
+    print("=" * 80)
+    print("LightGCN -- CoMemTree strict-fair baseline")
+    print("=" * 80)
+    print(f"Device                    : {device}")
+    print(f"Selected users            : {len(users)}")
+    train_lengths = [len(train_histories[uid]) for uid in users]
+    print(f"Max train interactions/user: {args.history_size}")
+    print(f"Actual train length min/max: {min(train_lengths)}/{max(train_lengths)}")
+    print(f"Total train edges          : {len(train_edges)}")
+    print(f"Catalog/item nodes        : {len(item_ids)}")
+    print(f"Candidate seed            : {args.seed}")
+    print(f"Embedding dim             : {args.embedding_dim}")
+    print(f"LightGCN layers           : {args.n_layers}")
+    print(f"Epochs                    : {args.epochs}")
+    print("Uses old train outside cutoff: NO")
+    print("Uses val in training         : NO")
+    print("Uses test/GT in training     : NO")
+    print("Uses candidates in training  : NO")
+    print("Negative sampler knows       : TRAIN positives only")
+    print("Candidate construction       : EXACT CoMemTree protocol")
+    print("=" * 80)
+
+    losses = train_lightgcn(
+        model=model,
+        train_edges=train_edges,
+        user_forbidden=user_forbidden,
+        n_items=len(item_ids),
+        epochs=args.epochs,
+        lr=args.lr,
+        reg_weight=args.reg_weight,
+        seed=args.seed,
+    )
+
+    # -----------------------------------------------------------------
+    # Evaluation data are loaded ONLY AFTER training is complete.
+    # Nothing below this line can influence LightGCN fitting.
+    # -----------------------------------------------------------------
+    negatives_raw = load_json(args.negatives)
+    negatives = {str(k): v for k, v in negatives_raw.items()}
     candidate_rows = load_candidate_file(args.candidate_file)
 
-    # Freeze candidate rows BEFORE training/evaluation.
     fixed_candidates: Dict[str, Dict[str, Any]] = {}
     candidate_counts: List[int] = []
 
@@ -565,7 +689,10 @@ def main(args: argparse.Namespace) -> None:
                     f"user={uid}: target {t} is missing from candidates"
                 )
 
-        if args.expected_candidates > 0 and len(candidates) != args.expected_candidates:
+        if (
+            args.expected_candidates > 0
+            and len(candidates) != args.expected_candidates
+        ):
             raise ValueError(
                 f"user={uid}: expected {args.expected_candidates} candidates, "
                 f"got {len(candidates)}"
@@ -578,118 +705,9 @@ def main(args: argparse.Namespace) -> None:
         }
         candidate_counts.append(len(candidates))
 
-    # Build item universe from catalog + every item touched by the strict protocol.
-    catalog = catalog_item_ids(items_raw)
-    item_ids: List[str] = []
-    seen_items: Set[str] = set()
-
-    def add_item(iid: str) -> None:
-        iid = str(iid)
-        if iid not in seen_items:
-            seen_items.add(iid)
-            item_ids.append(iid)
-
-    for iid in catalog:
-        add_item(iid)
-
-    for uid in users:
-        row = sequences[uid]
-        for iid in as_str_list(row.get("train", [])):
-            add_item(iid)
-        for iid in as_str_list(row.get("val", [])):
-            add_item(iid)
-        for iid in as_str_list(row.get("test", [])):
-            add_item(iid)
-        for iid in fixed_candidates[uid]["candidates"]:
-            add_item(iid)
-
-    user_to_idx = {uid: idx for idx, uid in enumerate(users)}
-    item_to_idx = {iid: idx for idx, iid in enumerate(item_ids)}
-
-    # STRICT training graph: selected users x last history_size TRAIN interactions only.
-    train_edges: List[Tuple[int, int]] = []
-    train_histories: Dict[str, List[str]] = {}
-
-    for uid in users:
-        train_ids = as_str_list(sequences[uid].get("train", []))
-        if args.history_size > 0:
-            train_ids = train_ids[-args.history_size:]
-
-        if args.strict_history_size and len(train_ids) != args.history_size:
-            raise ValueError(
-                f"user={uid}: expected exactly {args.history_size} train interactions, "
-                f"got {len(train_ids)}"
-            )
-
-        train_histories[uid] = train_ids
-        uidx = user_to_idx[uid]
-
-        for iid in train_ids:
-            train_edges.append((uidx, item_to_idx[iid]))
-
-    expected_edges = len(users) * args.history_size
-    if args.strict_history_size and len(train_edges) != expected_edges:
-        raise ValueError(
-            f"Expected {expected_edges} user-item training edges, got {len(train_edges)}"
-        )
-
-    # Negative-sampling exclusion: all known positives for the same user.
-    # We do NOT add val/test as graph edges.
-    user_forbidden: List[Set[int]] = [set() for _ in users]
-    for uid in users:
-        uidx = user_to_idx[uid]
-        known_positive_ids = (
-            as_str_list(sequences[uid].get("train", []))
-            + as_str_list(sequences[uid].get("val", []))
-            + as_str_list(sequences[uid].get("test", []))
-        )
-        user_forbidden[uidx] = {
-            item_to_idx[iid]
-            for iid in known_positive_ids
-            if iid in item_to_idx
-        }
-
-    norm_adj = build_normalized_adj(
-        n_users=len(users),
-        n_items=len(item_ids),
-        edges=train_edges,
-        device=device,
-    )
-
-    model = LightGCN(
-        n_users=len(users),
-        n_items=len(item_ids),
-        embedding_dim=args.embedding_dim,
-        n_layers=args.n_layers,
-        norm_adj=norm_adj,
-    ).to(device)
-
-    print("=" * 80)
-    print("LightGCN -- CoMemTree strict-fair baseline")
-    print("=" * 80)
-    print(f"Device                    : {device}")
-    print(f"Selected users            : {len(users)}")
-    print(f"Train interactions/user   : {args.history_size}")
-    print(f"Total train edges         : {len(train_edges)}")
-    print(f"Catalog/item nodes        : {len(item_ids)}")
-    print(f"Candidate count min/max   : {min(candidate_counts)}/{max(candidate_counts)}")
-    print(f"Candidate seed            : {args.seed}")
-    print(f"Embedding dim             : {args.embedding_dim}")
-    print(f"LightGCN layers           : {args.n_layers}")
-    print(f"Epochs                    : {args.epochs}")
-    print("Uses val/test as train edge: NO")
-    print("Candidate construction     : EXACT CoMemTree protocol")
-    print("=" * 80)
-
-    losses = train_lightgcn(
-        model=model,
-        train_edges=train_edges,
-        user_forbidden=user_forbidden,
-        n_items=len(item_ids),
-        epochs=args.epochs,
-        lr=args.lr,
-        reg_weight=args.reg_weight,
-        seed=args.seed,
+    print(
+        f"Evaluation candidates min/max: "
+        f"{min(candidate_counts)}/{max(candidate_counts)}"
     )
 
     # Final propagation once; rank only within each user's frozen candidate set.
@@ -705,6 +723,17 @@ def main(args: argparse.Namespace) -> None:
         row = fixed_candidates[uid]
         candidates = [str(x) for x in row["candidates"]]
         targets = [str(x) for x in row["targets"]]
+
+        missing_from_train_catalog = [
+            iid for iid in candidates if iid not in item_to_idx
+        ]
+        if missing_from_train_catalog:
+            raise ValueError(
+                f"user={uid}: evaluation candidate(s) missing from items.json/"
+                f"train-time catalog: {missing_from_train_catalog[:5]}. "
+                "Do not add them from test data before training; fix the dataset "
+                "catalog instead."
+            )
 
         cidx = torch.tensor(
             [item_to_idx[iid] for iid in candidates],
@@ -778,11 +807,18 @@ def main(args: argparse.Namespace) -> None:
         },
         "fairness": {
             "n_users": len(users),
-            "history_size": args.history_size,
+            "history_size_max": args.history_size,
+            "train_length_min": min(len(train_histories[u]) for u in users),
+            "train_length_max": max(len(train_histories[u]) for u in users),
             "total_train_edges": len(train_edges),
-            "train_source": "train only",
-            "uses_val_as_train_edge": False,
-            "uses_test_as_train_edge": False,
+            "train_source": "last <= history_size interactions from train only",
+            "uses_old_train_outside_cutoff_in_training": False,
+            "uses_val_in_training": False,
+            "uses_test_in_training": False,
+            "uses_test_target_to_filter_bpr_negatives": False,
+            "uses_candidates_in_training": False,
+            "train_item_universe": "items.json catalog + used train IDs only",
+            "bpr_negative_exclusion": "only positives in the training graph",
             "candidate_seed": args.seed,
             "candidate_count_min": min(candidate_counts),
             "candidate_count_max": max(candidate_counts),
@@ -857,7 +893,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--strict-history-size",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
+        help=(
+            "Deprecated compatibility flag. CoMemTree treats history-size as "
+            "a maximum cutoff, so exact length is not required."
+        ),
     )
     p.add_argument(
         "--strict-one-target",
