@@ -136,3 +136,6 @@ python infer_tree_gemma_precom.py \
 - Default embedding model: `Qwen/Qwen3-Embedding-0.6B`
 - Use the same embedding model for global-memory construction and memory-based inference.
 - All scripts support resume by default.
+
+inference_tree_latest_behavior_gemma_clabel for labeling candidate as Cxx: c01-c20
+inference_tree_latest_behavior_gemma_video_game for video game prompt.
